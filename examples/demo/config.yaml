@@ -1,0 +1,13 @@
+filters:
+  - field: ebitda_m
+    op: ">="
+    value: 0.20
+scenario:
+  r: 0.10
+  m: -0.02
+  delta_d: 100
+forecast:
+  min_train_periods: 4
+quotes:
+  timeout_seconds: 10
+  moex_boards: {}

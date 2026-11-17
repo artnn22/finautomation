@@ -1,0 +1,55 @@
+{
+  "history": {
+    "columns": [
+      "BOARDID",
+      "SECID",
+      "TRADEDATE",
+      "CURRENCYID",
+      "TRADINGSESSION",
+      "CLOSE"
+    ],
+    "data": [
+      [
+        "TQBR",
+        "SBER",
+        "2024-12-24",
+        "SUR",
+        3,
+        264.34
+      ],
+      [
+        "TQBR",
+        "SBER",
+        "2024-12-25",
+        "SUR",
+        3,
+        271.69
+      ]
+    ]
+  },
+  "history.cursor": {
+    "metadata": {
+      "INDEX": {
+        "type": "int64"
+      },
+      "TOTAL": {
+        "type": "int64"
+      },
+      "PAGESIZE": {
+        "type": "int64"
+      }
+    },
+    "columns": [
+      "INDEX",
+      "TOTAL",
+      "PAGESIZE"
+    ],
+    "data": [
+      [
+        0,
+        2,
+        100
+      ]
+    ]
+  }
+}

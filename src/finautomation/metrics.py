@@ -4,7 +4,7 @@ import json
 import math
 from bisect import bisect_right
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from .inputs import Observation, Statement
@@ -19,6 +19,7 @@ METRIC_COLUMNS = (
     "ev", "ev_ebitda",
 )
 TRACE_COLUMNS = ("metric", "formula", "value", "status", "missing_fields", "inputs")
+PE_ALERT_THRESHOLD = Decimal("0.20")
 ALERT_COLUMNS = (
     "date", "fy_period_end", "ttm_periods", "quote_date", "market_cap",
     "pe_fy_at_quarter", "pe_ttm_at_quarter", "deviation", "threshold",
@@ -28,7 +29,7 @@ SCENARIO_FIELDS = (
 )
 SCENARIO_COLUMNS = (
     "r", "m", "delta_d", *(f"{prefix}_{field}" for field in SCENARIO_FIELDS
-                           for prefix in ("base", "scenario")), "statuses",
+                           for prefix in ("base", "scenario")), "formulas", "statuses",
 )
 
 
@@ -115,6 +116,13 @@ def tax_rate(tax, profit):
     return tax / profit
 
 
+def ttm_multiple(cap, *incomes):
+    total = sum(Decimal(str(value)) for value in incomes)
+    if total == 0:
+        raise ZeroDivisionError
+    return float(Decimal(str(cap)) / total)
+
+
 def periods_by_month(statements):
     """Treat ambiguous dates in the same fiscal month as unavailable for windows."""
     buckets = defaultdict(list)
@@ -143,11 +151,13 @@ def calculate_period(statement, history, same_frequency, quarters):
     for field in ("revenue", "ebit", "profit_before_tax", "income_tax_expense", "operating_cf"):
         direct(field, field)
     prior = same_frequency.get(month_index(statement.period_end) - 12)
+    previous_revenue = Observation("revenue_prior", None, None, "", "", reason="missing_prior_year_period")
+    if prior:
+        previous_revenue = replace(prior.fields["revenue"], field="revenue_prior",
+                                   source_field=prior.fields["revenue"].source_field or "revenue")
     fields = {
         **fields,
-        "revenue_prior": prior.fields["revenue"] if prior else Observation(
-            "revenue_prior", None, None, "", "", reason="missing_prior_year_period"
-        ),
+        "revenue_prior": previous_revenue,
         "close": history.close_at(statement.period_end),
     }
     calc("revenue_yoy", "revenue / revenue_prior − 1", lambda a, b: a / b - 1, "revenue", "revenue_prior")
@@ -155,8 +165,8 @@ def calculate_period(statement, history, same_frequency, quarters):
     calc("operating_margin", "ebit / revenue", ratio, "ebit", "revenue")
     calc("net_margin", "net_income / revenue", ratio, "net_income", "revenue")
     calc("ebitda", "ebit + da", lambda a, b: a + b, "ebit", "da")
-    calc("ebitda_m", "ebitda / revenue", ratio, "ebitda", "revenue")
     calc("adjusted_ebitda", "ebitda + ebitda_adjustments", lambda a, b: a + b, "ebitda", "ebitda_adjustments")
+    calc("ebitda_m", "ebitda / revenue", ratio, "ebitda", "revenue")
     calc("adjusted_ebitda_m", "adjusted_ebitda / revenue", ratio, "adjusted_ebitda", "revenue")
     calc("effective_tax_rate", "income_tax_expense / profit_before_tax при PBT > 0", tax_rate,
          "income_tax_expense", "profit_before_tax")
@@ -173,7 +183,8 @@ def calculate_period(statement, history, same_frequency, quarters):
     calc("price", "последнее close не позже period_end", lambda value: value, "close")
     for months in (1, 3, 12):
         historical = f"close_{months}m"
-        fields[historical] = history.close_at(shift_months(statement.period_end, -months))
+        original = history.close_at(shift_months(statement.period_end, -months))
+        fields[historical] = replace(original, field=historical, source_field=original.source_field or "close")
         calc(f"return_{months}m", f"price / {historical} − 1", lambda a, b: a / b - 1, "price", historical)
     calc("market_cap", "price × shares", lambda a, b: a * b, "price", "shares")
     fy = statement.period_type == "FY"
@@ -182,7 +193,7 @@ def calculate_period(statement, history, same_frequency, quarters):
     window = quarterly_window(quarters, statement) if not fy else []
     results["pe_ttm"] = evaluate(
         "pe_ttm", "market_cap / сумма net_income за 4 последовательных квартала",
-        lambda cap, *incomes: cap / sum(incomes),
+        ttm_multiple,
         [results["market_cap"], *(item.fields["net_income"] for item in window)],
         status="not_applicable_period" if fy else (None if window else "incomplete_ttm_window"),
     )
@@ -196,6 +207,7 @@ def calculate_period(statement, history, same_frequency, quarters):
 class PeriodResult:
     statement: Statement
     calculations: dict[str, Calculation]
+    pe_comparison: dict | None = None
 
     def columns(self):
         return {
@@ -207,44 +219,54 @@ class PeriodResult:
         return [{**self.statement.columns(), **self.calculations[name].trace()} for name in METRIC_COLUMNS]
 
 
-def divergence(quarter, years, quarters):
+def compare_pe(quarter, years, quarters):
     statement = quarter.statement
     cap = quarter.calculations["market_cap"].value
-    pe_ttm = quarter.calculations["pe_ttm"].value
+    ttm = quarter.calculations["pe_ttm"]
     last_fy = next((year for year in reversed(years) if year.period_end <= statement.period_end), None)
-    if cap is None or pe_ttm is None or last_fy is None:
-        return None
-    ni = last_fy.fields["net_income"].value
-    if ni in (None, 0):
-        return None
-
-    # Decimal comparison keeps the exact 20% boundary from flipping due to float rounding.
     window = quarterly_window(quarters, statement)
+    quote = quarter.calculations["price"].inputs["1. close"]
+    comparison = {
+        **statement.instrument.columns(), "date": statement.period_end,
+        "fy_period_end": last_fy.period_end if last_fy else None,
+        "ttm_periods": json_cell([item.period_end for item in window]),
+        "quote_date": quote["date"] if quote["value"] is not None else None,
+        "market_cap": cap, "pe_fy_at_quarter": None, "pe_ttm_at_quarter": ttm.value,
+        "deviation": None, "threshold": float(PE_ALERT_THRESHOLD), "reason": "", "alert": False,
+    }
+    ni = last_fy.fields["net_income"].value if last_fy else None
+    if not last_fy:
+        fy_reason = "missing_fy_period"
+    elif ni is None:
+        fy_reason = "missing_fy_profit"
+    elif ni == 0:
+        fy_reason = "zero_fy_profit"
+    elif cap is None:
+        fy_reason = "missing_quarter_cap"
+    else:
+        fy_ratio = float(Decimal(str(cap)) / Decimal(str(ni)))
+        fy_reason = "" if math.isfinite(fy_ratio) else "nonfinite_result"
+        if not fy_reason:
+            comparison["pe_fy_at_quarter"] = fy_ratio
+    if ttm.value is None or fy_reason:
+        comparison["reason"] = fy_reason or ttm.status
+        return comparison
+
+    # Compare at the boundary before converting the percentage back to float.
     common_cap = Decimal(str(cap))
     ttm_income = sum(Decimal(str(item.fields["net_income"].value)) for item in window)
-    if ttm_income == 0:
-        return None
-    fy_ratio = common_cap / Decimal(str(ni))
-    ttm_ratio = common_cap / ttm_income
     numerator = abs(ttm_income - Decimal(str(ni)))
     denominator = abs(Decimal(str(ni)))
-    if abs(ttm_ratio) < Decimal("0.000001"):
+    if abs(common_cap) < abs(ttm_income) * Decimal("0.000001"):
         numerator *= abs(common_cap)
         denominator *= abs(ttm_income) * Decimal("0.000001")
-    if numerator <= Decimal("0.20") * denominator:
-        return None
-    difference = numerator / denominator
-    pe_fy_at_quarter, pe_ttm_at_quarter, deviation = map(float, (fy_ratio, ttm_ratio, difference))
-    if not all(map(math.isfinite, (pe_fy_at_quarter, pe_ttm_at_quarter, deviation))):
-        return None
-    quote = quarter.calculations["price"].inputs["1. close"]
-    return {
-        **statement.instrument.columns(), "date": statement.period_end,
-        "fy_period_end": last_fy.period_end,
-        "ttm_periods": json_cell([item.period_end for item in window]),
-        "quote_date": quote["date"], "market_cap": cap, "pe_fy_at_quarter": pe_fy_at_quarter,
-        "pe_ttm_at_quarter": pe_ttm_at_quarter, "deviation": deviation, "threshold": 0.20,
-    }
+    deviation = float(numerator / denominator)
+    if math.isfinite(deviation):
+        comparison["deviation"] = deviation
+        comparison["alert"] = numerator > PE_ALERT_THRESHOLD * denominator
+    else:
+        comparison["reason"] = "nonfinite_result"
+    return comparison
 
 
 def analyze(statements, quotes):
@@ -269,9 +291,10 @@ def analyze(statements, quotes):
         results.extend(rows)
         current = next((row for row in reversed(rows) if row.statement.period_type == "Q"), None)
         if current is not None:
-            alert = divergence(current, years, month_maps["Q"])
-            if alert is not None:
-                alerts.append(alert)
+            comparison = compare_pe(current, years, month_maps["Q"])
+            current.pe_comparison = comparison
+            if comparison["alert"]:
+                alerts.append({key: comparison[key] for key in (*instrument.columns(), *ALERT_COLUMNS)})
     return results, alerts
 
 
@@ -310,6 +333,7 @@ def scenario(period, changes):
         **period.statement.columns(), **changes,
         **{f"base_{field}": base[field].value for field in SCENARIO_FIELDS},
         **{f"scenario_{field}": changed[field].value for field in SCENARIO_FIELDS},
+        "formulas": json_cell({name: item.formula for name, item in changed.items()}),
         "statuses": json_cell({name: {"status": item.status, "missing_fields": item.missing}
                                for name, item in changed.items()}),
     }

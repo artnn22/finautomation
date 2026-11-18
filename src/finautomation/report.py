@@ -4,6 +4,7 @@ import json
 from collections import defaultdict
 from html import escape
 
+from .forecast import MODEL_LABELS
 from .inputs import PERIOD_COLUMNS
 from .metrics import SCENARIO_FIELDS
 
@@ -30,16 +31,23 @@ STATUSES = {
     "missing_value": "Поле отсутствует", "invalid_number": "Некорректное число",
     "nonfinite_number": "Неконечное число", "no_close_at_cutoff": "Нет закрытия до даты отсечки",
     "missing_prior_year_period": "Нет сопоставимого периода прошлого года",
+    "missing_prior_ytd": "Нет предыдущего накопительного периода того же финансового года",
     "ambiguous_period": "Несколько отчётных дат в одном месяце",
     "insufficient_contiguous_history": "Короткий или прерванный ряд",
     "nonfinite_prediction": "Прогноз вне числового диапазона",
     "pass": "Критерий выполнен", "fail": "Критерий не выполнен",
+    "missing_fy_period": "Нет завершённого финансового года к дате квартала",
+    "missing_fy_profit": "В годовой отчётности отсутствует чистая прибыль",
+    "zero_fy_profit": "Чистая прибыль за финансовый год равна нулю",
+    "missing_quarter_cap": "Недоступна капитализация на конец квартала",
+    "nonpositive_close": "Цена закрытия должна быть положительной",
 }
 PERCENTAGES = {
     "revenue_yoy", "gross_margin", "operating_margin", "net_margin", "ebitda_m", "adjusted_ebitda_m",
     "effective_tax_rate", "roe", "roa", "return_1m", "return_3m", "return_12m", "forecast_growth",
 }
 SCREEN_FIELDS = ("revenue", "ebitda", "ebitda_m", "pe_fy", "pe_ttm", "ev_ebitda", "de", "cr", "effective_tax_rate")
+TAX_FIELDS = ("profit_before_tax", "income_tax_expense", "effective_tax_rate")
 
 CSS = """
 :root{color-scheme:light;font:15px/1.5 Inter,system-ui,sans-serif;color:#1f2937;background:#f4f6fa}
@@ -54,6 +62,14 @@ th{background:#f4f7fc;white-space:nowrap}td:nth-child(2){min-width:70px}td{overf
 details{margin:.35em 0}details.period{border-top:1px solid #dae0ea;padding:10px 0}
 summary{cursor:pointer;color:#174aa1;font-weight:600}.inputs{padding-left:1.25rem;font-size:.9rem}
 nav ul{display:flex;flex-wrap:wrap;gap:8px 24px;padding-left:18px}.status{color:#5d4c32}
+@media(prefers-color-scheme:dark){
+  :root{color-scheme:dark;color:#edf1fc;background:#101725}
+  h1,h2,h3,h4{color:#eef2fd}
+  a,summary{color:#aab6ff}a:focus-visible,summary:focus-visible{outline-color:#aab6ff}
+  section,header,article{background:#182235;border-color:#34415a}
+  .summary{color:#acb9d1}.warning{border-color:#ffc783;background:#443422}.status{color:#f2cea8}
+  th{background:#202c43}th,td{border-color:#34415a}details.period{border-color:#34415a}
+}
 """
 
 
@@ -86,9 +102,15 @@ def details_inputs(inputs):
             items.append(f'<li>{name} · {info}{details_inputs(value["inputs"])}</li>')
             continue
         parts = [f'{name} = {display(value["value"])}']
-        if value["raw"] is not None and str(value["raw"]) != str(value["value"]):
-            parts.append(f'вход {html(value["raw"])}')
+        if value.get("source_field") and value["source_field"] != key.split(". ", 1)[-1]:
+            parts.append(f'поле источника {html(value["source_field"])}')
+        if value["raw"] is not None:
+            parts.append(f'исходное значение {html(value["raw"])}')
+        if value.get("scale") not in (None, 1):
+            parts.append(f'масштаб ×{display(value["scale"])}')
         parts.extend(html(value[name]) for name in ("date", "source_ref") if value[name])
+        if value.get("source_period_end") and value["source_period_end"] != value["date"]:
+            parts.append(f'дата периода в источнике {html(value["source_period_end"])}')
         if value["row"]:
             parts.append(f'строка {value["row"]}')
         if value["retrieved_at"]:
@@ -99,9 +121,10 @@ def details_inputs(inputs):
     return '<ul class="inputs">' + "".join(items) + "</ul>" if items else ""
 
 
-def formula_table(period):
+def formula_table(period, fields):
     rows = []
-    for name, calc in period.calculations.items():
+    for name in fields:
+        calc = period.calculations[name]
         status = "" if calc.status == "ok" else html(STATUSES.get(calc.status, calc.status))
         inputs = details_inputs(calc.inputs)
         formula = html(calc.formula)
@@ -113,14 +136,38 @@ def formula_table(period):
 
 def scenario_table(row):
     statuses = json.loads(row["statuses"])
-    return table(("Показатель", "База", "Сценарий", "Статус"), (
+    formulas = json.loads(row["formulas"])
+    return table(("Показатель", "База", "Сценарий", "Формула", "Статус"), (
         [html(LABELS[field]), display(row[f"base_{field}"], field), display(row[f"scenario_{field}"], field),
+         html(formulas[field]),
          html(STATUSES.get(statuses[field]["status"], statuses[field]["status"]))]
         for field in SCENARIO_FIELDS
     ))
 
 
-def make_report(results, screened, scenarios, alerts, forecasts, stats, settings):
+def pe_summary(comparison):
+    ttm_periods = ", ".join(json.loads(comparison["ttm_periods"]))
+    status = STATUSES.get(comparison["reason"], comparison["reason"])
+    attr = ""
+    if comparison["alert"]:
+        status = "Сигнал расхождения"
+        attr = ' class="warning"'
+    elif not status:
+        status = "В пределах порога"
+    threshold = f'{comparison["threshold"]:.0%}'
+    return (
+        f'<h4>Сравнение P/E при общей капитализации</h4>'
+        f'<p{attr}>{html(status)}. Расхождение {display(comparison["deviation"], "forecast_growth")}, '
+        f'порог {threshold}. Квартал {display(comparison["date"])}, '
+        f'цена на {display(comparison["quote_date"])}, капитализация {display(comparison["market_cap"])}.</p>'
+        + table(("Методика", "P/E", "Периоды чистой прибыли"), (
+            ("P/E FY", display(comparison["pe_fy_at_quarter"]), display(comparison["fy_period_end"])),
+            ("P/E TTM", display(comparison["pe_ttm_at_quarter"]), display(ttm_periods or None)),
+        ))
+    )
+
+
+def make_report(results, screened, scenarios, forecasts, stats, settings):
     by_instrument = defaultdict(list)
     for period in results:
         by_instrument[period.statement.instrument].append(period)
@@ -151,7 +198,6 @@ def make_report(results, screened, scenarios, alerts, forecasts, stats, settings
         return tuple(row[field] for field in PERIOD_COLUMNS)
 
     scenarios_by_period = {key(row): row for row in scenarios}
-    alerts_by_instrument = {(row["source"], row["ticker"], row["currency"]): row for row in alerts}
     latest_forecasts = {(row["source"], row["ticker"], row["currency"], row["period_type"]): row
                         for row in forecasts if row["kind"] == "next"}
     for instrument, periods in by_instrument.items():
@@ -160,21 +206,16 @@ def make_report(results, screened, scenarios, alerts, forecasts, stats, settings
         title = html(f"{instrument.ticker} · {instrument.source.upper()} · {instrument.currency}")
         nav.append(f'<li><a href="#{anchor}">{title}</a></li>')
         blocks = [f'<article id="{anchor}"><h3>{title}</h3>']
-        if alert := alerts_by_instrument.get(identity):
-            ttm_periods = ", ".join(json.loads(alert["ttm_periods"]))
-            blocks.append(
-                f'<p class="warning">P/E расходятся на {alert["deviation"]:.2%} на {html(alert["date"])}. '
-                f'При общей капитализации P/E FY = {display(alert["pe_fy_at_quarter"])}, '
-                f'P/E TTM = {display(alert["pe_ttm_at_quarter"])}. Годовая прибыль на '
-                f'{html(alert["fy_period_end"])}, кварталы TTM {html(ttm_periods)}, '
-                f'цена на {html(alert["quote_date"])}.</p>'
-            )
+        comparison = next((period.pe_comparison for period in periods if period.pe_comparison), None)
+        if comparison:
+            blocks.append(pe_summary(comparison))
         latest = [latest_forecasts[(*identity, frequency)] for frequency in ("Q", "FY")
                   if (*identity, frequency) in latest_forecasts]
         blocks.append("<h4>Прогноз выручки</h4>" + table(
-            ("Период", "Целевая дата", "Прогноз", "Naive", "Рост", "Статус"),
+            ("Период", "Целевая дата", "Прогноз", "Метод", "Naive", "Дата Naive", "Рост", "Статус"),
             ([html(row["period_type"]), html(row["target_period_end"]), display(row["forecast"]),
-              display(row["naive"]), display(row["forecast_growth"], "forecast_growth"),
+              display(MODEL_LABELS.get(row["model"])), display(row["naive"]), display(row["naive_period_end"]),
+              display(row["forecast_growth"], "forecast_growth"),
               html(STATUSES.get(row["reason"] or row["status"], row["reason"] or row["status"]))] for row in latest),
         ))
         for index, period in enumerate(reversed(periods)):
@@ -182,7 +223,9 @@ def make_report(results, screened, scenarios, alerts, forecasts, stats, settings
             opened = " open" if index == 0 else ""
             blocks.append(
                 f'<details class="period"{opened}><summary>{html(current.period_type)} · {current.period_end}</summary>'
-                + formula_table(period) + "<h4>Сценарий</h4>" + scenario_table(scenarios_by_period[key(current.columns())])
+                + formula_table(period, (field for field in period.calculations if field not in TAX_FIELDS))
+                + "<h4>Налоги</h4>" + formula_table(period, TAX_FIELDS)
+                + "<h4>Сценарий</h4>" + scenario_table(scenarios_by_period[key(current.columns())])
                 + "</details>"
             )
         cards.append("".join(blocks) + '<p><a href="#top">К скринеру</a></p></article>')
@@ -191,9 +234,26 @@ def make_report(results, screened, scenarios, alerts, forecasts, stats, settings
     score_line = (
         f'MAPE модели {display(forecast["mape_model"], "forecast_growth")}, '
         f'Naive {display(forecast["mape_naive"], "forecast_growth")}. '
-        f'Допустимых точек {forecast["eligible_points"]}. {html(STATUSES[forecast["status"]])}.'
+        f'Допустимых точек {forecast["eligible_points"]}, исключено {forecast["excluded_points"]}. '
+        f'{html(STATUSES[forecast["status"]])}.'
     )
-    input_type = "Учебный синтетический набор" if stats["synthetic_demo"] else "Отчёт по входным данным"
+    frequency_rows = []
+    for kind, label in (("Q", "Квартал"), ("FY", "Год")):
+        result = forecast["by_period_type"][kind]
+        frequency_rows.append((
+            label, display(result["mape_model"], "forecast_growth"),
+            display(result["mape_linear_reference"], "forecast_growth"), display(result["mape_naive"], "forecast_growth"),
+            html(result["eligible_points"]), html(STATUSES[result["status"]]),
+        ))
+    frequency_scores = table(("Период", "MAPE модели", "Базовый тренд", "MAPE Naive", "Точек", "Статус"), frequency_rows)
+    if stats["synthetic_demo"]:
+        input_type = "Учебный синтетический набор"
+    elif stats["financials_mode"] == "yahoo":
+        input_type = "Отчётность Yahoo Finance"
+    elif stats["financials_mode"] == "mixed":
+        input_type = "Отчётность из CSV и Yahoo Finance"
+    else:
+        input_type = "Отчёт по входным данным"
     changes = settings.scenario
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -203,7 +263,8 @@ def make_report(results, screened, scenarios, alerts, forecasts, stats, settings
 <a href="formula_trace.csv">След расчёта CSV</a></header>
 <main><section><h2>Скринер</h2><p>{parameters}. Бумаг в списке {summary["requested"]},
 обработано {summary["processed"]}, прошли отбор {stats["screener"]["passed_instruments"]}.</p>{table_html}</section>
-<section><h2>Проверка прогноза</h2><p>{score_line}</p><a href="forecast_next_period.csv">Прогноз и контрольные точки CSV</a></section>
+<section><h2>Проверка прогноза</h2><p>{score_line}</p>{frequency_scores}
+<a href="forecast_next_period.csv">Прогноз и контрольные точки CSV</a></section>
 <section><h2>Параметры сценария</h2><p>Выручка {changes['r']:+.2%}, маржа EBITDA {changes['m'] * 100:+g} п. п.,
 долг {display(changes['delta_d'])} в валюте отчётности.</p></section>
 <nav aria-label="Карточки эмитентов"><ul>{''.join(nav)}</ul></nav>{''.join(cards)}</main></body></html>

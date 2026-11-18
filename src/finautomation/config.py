@@ -42,9 +42,15 @@ def mapping(value, allowed, name):
 
 
 def finite(value, name):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name}: ожидается конечное число")
-    return float(value)
+    try:
+        value = float(value)
+    except OverflowError as error:
+        raise ValueError(f"{name}: ожидается конечное число") from error
+    if not math.isfinite(value):
+        raise ValueError(f"{name}: ожидается конечное число")
+    return value
 
 
 def load_settings(path: Path):

@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Опекс · Анализ эмитентов</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Опекс, на главную"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>ОПЕКС</a>
+    <nav class="topnav" aria-label="Разделы">
+      <button type="button" class="nav-button active" id="nav-work" aria-current="page">Анализ</button>
+      <button type="button" class="nav-button" id="nav-history">История</button>
+    </nav>
+    <div class="top-actions">
+      <span class="connection"><i></i> Локальный режим</span>
+      <button type="button" class="button quiet theme" id="theme" aria-label="Сменить тему" aria-pressed="false"><span aria-hidden="true">◐</span> <span id="theme-label">Тёмная тема</span></button>
+    </div>
+  </header>
+  <main>
+    <section id="workspace">
+      <div class="page-title">
+        <div><h1>Анализ эмитентов</h1><p>Скринер, финансовые показатели и прогноз выручки в одном расчёте.</p></div>
+        <a class="button outline" id="open-window" target="_blank" rel="noopener" hidden>Отчёт в новом окне ↗</a>
+      </div>
+      <div class="layout">
+        <aside class="card controls">
+          <div class="card-heading"><h2>Параметры расчёта</h2></div>
+          <form id="run-form">
+            <fieldset class="input-section source-section">
+              <legend>Источники данных</legend>
+              <div class="segmented modes">
+                <label><input type="radio" name="mode" value="demo" checked><span>Учебные</span></label>
+                <label><input type="radio" name="mode" value="csv"><span>Из CSV</span></label>
+                <label><input type="radio" name="mode" value="online"><span>Онлайн</span></label>
+              </div>
+              <p id="mode-note" class="hint">8 учебных эмитентов. Расчёт работает без сети.</p>
+              <div id="custom-inputs" hidden>
+                <label for="tickers">Тикеры и источники</label>
+                <textarea id="tickers" rows="3" placeholder="AAPL,yahoo&#10;SBER,moex" spellcheck="false"></textarea>
+                <p class="hint">Одна бумага на строку. Формат ticker,market.</p>
+                <label class="upload">Загрузить список CSV<input type="file" id="tickers-file" accept=".csv,text/csv"></label>
+                <label class="upload"><span id="financial-label">Отчётность CSV</span><input type="file" id="financials" accept=".csv,text/csv"></label>
+                <label class="upload" id="quotes-input">Котировки CSV<input type="file" id="quotes" accept=".csv,text/csv"></label>
+                <label class="upload" id="dates-input" hidden>Поправки дат (необязательно)<input type="file" id="period-dates" accept=".csv,text/csv"></label>
+              </div>
+            </fieldset>
+            <fieldset class="input-section">
+              <legend>Фильтры скринера</legend>
+              <div id="filters"></div>
+              <button type="button" id="add-filter" class="text-button">＋ Добавить условие</button>
+            </fieldset>
+            <fieldset class="input-section">
+              <legend>Сценарий</legend>
+              <div class="field-grid">
+                <label>Выручка, %<input id="revenue-change" type="number" step="any" value="10" required></label>
+                <label>Маржа, п. п.<input id="margin-change" type="number" step="any" value="-2" required></label>
+                <label>Долг, ед. валюты<input id="debt-change" type="number" step="any" value="100" required></label>
+              </div>
+            </fieldset>
+            <fieldset class="input-section last">
+              <legend>Прогноз</legend>
+              <label class="inline-field">Минимум периодов обучения<input id="min-periods" type="number" min="2" step="1" value="4" required></label>
+            </fieldset>
+            <details id="advanced" class="advanced" hidden>
+              <summary>Параметры источников</summary>
+              <label class="inline-field">Таймаут, с<input id="timeout" type="number" min="1" step="any" value="10" required></label>
+              <label for="boards">Режимы торгов MOEX</label>
+              <textarea id="boards" rows="2" placeholder="SBER=TQBR" spellcheck="false"></textarea>
+            </details>
+            <button type="submit" id="calculate" class="button primary run-button"><span aria-hidden="true">▶</span> Запустить расчёт</button>
+            <p id="form-status" class="hint form-status" aria-live="polite"></p>
+          </form>
+        </aside>
+
+        <div class="output">
+          <section class="overview" aria-label="Сводка прогона">
+            <div><h2>Результаты расчёта</h2><p id="run-caption">Сводка появится после запуска.</p></div>
+            <span class="run-state" id="run-state"><i></i><span>Ожидает запуска</span></span>
+          </section>
+          <section class="stats" aria-label="Основные значения">
+            <div class="card stat"><span>С подходящей ценой</span><strong id="matched">—</strong><small id="coverage">Доля обработанного списка</small></div>
+            <div class="card stat"><span>Прошли отбор</span><strong id="passed">—</strong><small>Уникальные инструменты</small></div>
+            <div class="card stat"><span>MAPE модели</span><strong id="mape">—</strong><small id="points">По контрольным периодам</small></div>
+          </section>
+          <section class="card result">
+            <div class="tabs" aria-label="Представления результата">
+              <button type="button" class="tab active" data-tab="screen" aria-pressed="true">Скринер</button>
+              <button type="button" class="tab" data-tab="forecast" aria-pressed="false">Прогноз</button>
+              <button type="button" class="tab" data-tab="report" aria-pressed="false">Полный отчёт</button>
+              <button type="button" class="tab" data-tab="files" aria-pressed="false">Выгрузки</button>
+            </div>
+            <div id="empty" class="empty">
+              <div class="empty-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+              <h3 id="empty-title">Расчёт ещё не запущен</h3>
+              <p id="empty-text">Запустите учебный пример или подключите свои данные.</p>
+            </div>
+            <div id="screen-pane" class="pane" hidden>
+              <div class="pane-heading"><h3>Прошли условия отбора</h3><span class="hint">Первые 8 строк</span></div>
+              <div class="table-scroll"><table>
+                <thead><tr><th>Бумага</th><th>Период</th><th>Выручка</th><th>Маржа EBITDA</th><th>P/E</th></tr></thead>
+                <tbody id="screen-body"></tbody>
+              </table></div>
+              <p class="hint screen-note">Суммы указаны в единицах валюты строки.</p>
+            </div>
+            <div id="forecast-pane" class="pane" hidden>
+              <div class="pane-heading"><h3>Средняя ошибка прогноза</h3>
+                <div class="segmented frequencies" aria-label="Частота оценки">
+                  <label><input type="radio" name="frequency" value="Q" checked><span>Квартал</span></label>
+                  <label><input type="radio" name="frequency" value="FY"><span>Год</span></label>
+                </div>
+              </div>
+              <div id="forecast-values" class="forecast-values"></div>
+              <p id="forecast-note" class="hint"></p>
+            </div>
+            <div id="report-pane" class="pane report-pane" hidden>
+              <div class="pane-heading"><h3>Интерактивные карточки и формулы</h3></div>
+              <div id="report-frame"></div>
+            </div>
+            <div id="files-pane" class="pane" hidden><div class="pane-heading"><h3>Файлы запуска</h3></div><ul class="files" id="files"></ul></div>
+          </section>
+        </div>
+      </div>
+    </section>
+    <section id="history-view" hidden>
+      <div class="page-title"><div><h1>История запусков</h1><p>Сводки и отчёты, сохранённые на этом компьютере.</p></div>
+        <button id="new-run" type="button" class="button outline">К параметрам</button></div>
+      <div id="history-list" class="card history-list" aria-live="polite"></div>
+    </section>
+  </main>
+  <template id="filter-template">
+    <div class="filter-row">
+      <select class="field" aria-label="Показатель фильтра">
+        <option value="ebitda_m">Маржа EBITDA, %</option><option value="pe_fy">P/E FY</option>
+        <option value="ev_ebitda">EV / EBITDA</option><option value="de">Долг / капитал</option>
+        <option value="cr">Ликвидность</option><option value="effective_tax_rate">Налоговая ставка, %</option>
+      </select>
+      <select class="operator" aria-label="Оператор"><option value=">=">≥</option><option value="<=">≤</option><option value=">">&gt;</option><option value="<">&lt;</option><option value="==">=</option><option value="!=">≠</option></select>
+      <input class="limit" type="number" step="any" value="20" required aria-label="Порог фильтра">
+      <button type="button" class="remove-filter" aria-label="Удалить условие">×</button>
+    </div>
+  </template>
+</body>
+</html>

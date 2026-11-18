@@ -34,14 +34,15 @@ def valid_currency(currency):
             and currency.isalpha() and currency.isupper())
 
 
-def quote_record(source, ticker, currency, day, raw, ref, retrieved_at):
+def quote_record(source, ticker, currency, day, raw, ref, retrieved_at, source_field):
     if not valid_currency(currency):
         return None
     value, _ = number(raw)
     if value is None or value <= 0:
         return None
     instrument = Instrument(source, ticker, currency)
-    return Quote(instrument, day, Observation("close", value, raw, ref, retrieved_at, observed_on=day))
+    return Quote(instrument, day, Observation("close", value, raw, ref, retrieved_at, observed_on=day,
+                                              source_field=source_field))
 
 
 def moex_quotes(ticker, start, end, *, board, timeout):
@@ -61,7 +62,7 @@ def moex_quotes(ticker, start, end, *, board, timeout):
                     continue
                 day = iso_date(row["TRADEDATE"])
                 currency = {"SUR": "RUB"}.get(row["CURRENCYID"], row["CURRENCYID"])
-                item = quote_record("moex", ticker, currency, day, row["CLOSE"], reference, retrieved_at)
+                item = quote_record("moex", ticker, currency, day, row["CLOSE"], reference, retrieved_at, "CLOSE")
                 if item and start <= day <= end:
                     candidates[(item.instrument, day)].append((str(row.get("TRADINGSESSION")) == "3", item))
             if not data["history.cursor"]["data"]:
@@ -80,9 +81,8 @@ def moex_quotes(ticker, start, end, *, board, timeout):
     for entries in candidates.values():
         aggregate = [item for is_aggregate, item in entries if is_aggregate]
         selected = aggregate or [item for _, item in entries]
-        if len({item.close.value for item in selected}) > 1:
-            raise QuoteSourceError(f"MOEX ISS: несколько цен закрытия за {selected[0].day}")
-        result.append(selected[0])
+        # Leave contradictory prices for the same date to the shared CSV validator.
+        result.extend({item.close.value: item for item in selected}.values())
     return result
 
 
@@ -123,11 +123,12 @@ def yahoo_quotes(ticker, start, end, *, timeout):
         for timestamp, raw in zip(timestamps, closes, strict=True):
             day = datetime.fromtimestamp(timestamp, zone).date()
             if start <= day <= end:
-                item = quote_record("yahoo", ticker, currency, day, raw, reference, retrieved_at)
+                item = quote_record("yahoo", ticker, currency, day, raw, reference, retrieved_at,
+                                    "indicators.quote.close")
                 if item:
                     result.append(item)
         return result
-    except (OSError, HTTPException, ValueError, KeyError, TypeError, IndexError) as error:
+    except (OSError, HTTPException, ValueError, KeyError, TypeError, IndexError, OverflowError) as error:
         raise QuoteSourceError(f"Yahoo Finance: {error}") from error
 
 
@@ -140,7 +141,8 @@ def fetch_online(statements, settings, log):
         required = {item.instrument for item in reports}
         period_start = min(item.period_end for item in reports)
         first_cutoff = shift_months(period_start, -12)
-        start = shift_months(period_start, -13)
+        lower_bound = date(1997, 1, 1) if source == "moex" else date(1900, 1, 1)
+        start = shift_months(max(period_start, shift_months(lower_bound, 13)), -13)
         end = min(max(item.period_end for item in reports), today())
         adapter = moex_quotes if source == "moex" else yahoo_quotes
         options = {"timeout": settings.quote_timeout}
@@ -155,7 +157,6 @@ def fetch_online(statements, settings, log):
                 covered = {quote.instrument for quote in quotes if quote.day <= first_cutoff}
                 if required - covered:
                     # Suspended or sparsely traded securities may have an older last close.
-                    lower_bound = date(1997, 1, 1) if source == "moex" else date(1900, 1, 1)
                     if lower_bound < start:
                         quotes.extend(adapter(ticker, lower_bound, start - timedelta(days=1), **options))
         except QuoteSourceError as error:

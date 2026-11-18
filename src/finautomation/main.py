@@ -17,13 +17,14 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from .config import load_settings
+from .financials import ONLINE_FINANCIAL_COLUMNS, fetch_financials, read_period_dates
 from .forecast import FORECAST_COLUMNS, forecast_revenue
 from .inputs import (
     INSTRUMENT_COLUMNS, LOG_COLUMNS, PERIOD_COLUMNS, QUOTE_COLUMNS, log_entry, parse_tickers,
     read_records, write_csv,
 )
 from .metrics import (
-    ALERT_COLUMNS, METRIC_COLUMNS, SCENARIO_COLUMNS, TRACE_COLUMNS, analyze, json_cell, scenario,
+    ALERT_COLUMNS, METRIC_COLUMNS, PE_ALERT_THRESHOLD, SCENARIO_COLUMNS, TRACE_COLUMNS, analyze, json_cell, scenario,
 )
 from .quotes import fetch_online
 from .report import make_report
@@ -34,16 +35,31 @@ SCREEN_COLUMNS = (*PERIOD_COLUMNS, *METRIC_COLUMNS, "filters")
 def arguments(argv):
     parser = argparse.ArgumentParser(prog="finautomation", description="Опекс · финансовый анализ эмитентов")
     commands = parser.add_subparsers(dest="command", required=True)
+    web = commands.add_parser("serve", help="Запустить локальный интерфейс аналитика")
+    web.add_argument("--port", default=8765, type=int, help="Локальный HTTP-порт")
+    web.add_argument("--out", default=Path("runs/web"), type=Path, help="Папка веб-запусков")
+    web.add_argument("--examples", default=Path("examples/demo"), type=Path, help="Папка учебных CSV")
     command = commands.add_parser("run", help="Рассчитать показатели и собрать локальный HTML-отчёт")
     command.add_argument("--tickers", required=True, type=Path, help="Список бумаг CSV")
-    command.add_argument("--financials", required=True, type=Path, help="Подготовленная отчётность CSV")
+    command.add_argument("--financials", type=Path, action="append", default=[],
+                         help="Подготовленная отчётность CSV. Можно указать несколько раз")
+    command.add_argument("--online-financials", action="store_true",
+                         help="Загрузить отчётность Yahoo Finance для бумаг без локальной отчётности")
+    command.add_argument("--period-dates", type=Path, help="Точные даты отчётов для --online-financials, CSV")
     source = command.add_mutually_exclusive_group(required=True)
     source.add_argument("--quotes", type=Path, help="Подготовленные котировки CSV")
     source.add_argument("--online", action="store_true", help="Загрузить дневные цены с указанных площадок")
     command.add_argument("--config", required=True, type=Path, help="Параметры запуска YAML")
     command.add_argument("--out", required=True, type=Path, help="Каталог для отдельных папок запусков")
     command.add_argument("--synthetic-demo", action="store_true", help="Пометить учебные данные как синтетические")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command == "serve":
+        return args
+    if not (args.financials or args.online_financials):
+        command.error("Укажите --financials или --online-financials")
+    if args.period_dates and not args.online_financials:
+        command.error("--period-dates используется вместе с --online-financials")
+    return args
 
 
 def screen(results, settings):
@@ -58,9 +74,12 @@ def screen(results, settings):
     screened = [dict(row, filters=json_cell(filters)) for row in rows
                 if all(rule.matches(row) for rule in settings.filters)]
     passed = len({tuple(row[key] for key in INSTRUMENT_COLUMNS) for row in screened})
+    candidates = len({instrument for instrument, _ in latest})
+    status = ("pass" if passed else "fail") if candidates >= 8 else "not_evaluable"
     return screened, {
         "filters": filters, "candidate_rows": len(rows), "excluded_rows": len(rows) - len(screened),
-        "passed_rows": len(screened), "passed_instruments": passed,
+        "candidate_instruments": candidates, "passed_rows": len(screened), "passed_instruments": passed,
+        "minimum_candidate_instruments": 8, "status": status,
     }
 
 
@@ -94,14 +113,21 @@ def snapshot(args, destination):
     folder.mkdir()
     files = {
         "tickers": (args.tickers, folder / "tickers.csv"),
-        "financials": (args.financials, folder / "financials.csv"),
         "config": (args.config, folder / "config.yaml"),
     }
+    if args.period_dates is not None:
+        files["period_dates"] = (args.period_dates, folder / "period_dates.csv")
     if args.quotes is not None:
         files["quotes"] = (args.quotes, folder / "quotes.csv")
     for source, target in files.values():
         shutil.copyfile(source, target)
-    return {key: target for key, (_, target) in files.items()}
+    snapshots = {key: target for key, (_, target) in files.items()}
+    snapshots["financials"] = []
+    for index, source in enumerate(args.financials, 1):
+        target = folder / ("financials.csv" if index == 1 else f"financials_{index}.csv")
+        shutil.copyfile(source, target)
+        snapshots["financials"].append(target)
+    return snapshots
 
 
 def run_pipeline(args, destination, started):
@@ -110,7 +136,18 @@ def run_pipeline(args, destination, started):
     log = []
     settings = load_settings(files["config"])
     requested = parse_tickers(files["tickers"], log)
-    statements = read_records(files["financials"], requested, log, statements=True)
+    local_pairs = set()
+    statements = read_records(files["financials"], requested, log, statements=True, seen=local_pairs)
+    financials_mode = "csv"
+    if args.online_financials:
+        dates = read_period_dates(files["period_dates"], requested, log) if args.period_dates else {}
+        missing = {pair: row for pair, row in requested.items() if pair not in local_pairs}
+        financials_mode = "mixed" if args.financials else "yahoo"
+        filename = "financials_yahoo.csv" if args.financials else "financials.csv"
+        online_path = destination / "inputs" / filename
+        downloaded = fetch_financials(missing, settings, started.date(), dates, log)
+        write_csv(online_path, ONLINE_FINANCIAL_COLUMNS, downloaded)
+        statements.extend(read_records(online_path, missing, log, statements=True))
     if args.online:
         files["quotes"] = destination / "inputs" / "quotes.csv"
         fetched = fetch_online(statements, settings, log)
@@ -124,7 +161,9 @@ def run_pipeline(args, destination, started):
     stats = {
         "version": version("finautomation"), "started_at": started.isoformat(timespec="seconds"),
         "quote_mode": "online" if args.online else "csv", "synthetic_demo": args.synthetic_demo,
+        "financials_mode": financials_mode,
         "ingestion": ingestion, "screener": screen_stats, "forecast": forecast_stats,
+        "pe_divergence": {"threshold": float(PE_ALERT_THRESHOLD), "alerts": len(alerts)},
         "elapsed_seconds": round(time.monotonic() - clock, 3),
     }
     log.append(log_entry("run", "complete", f'Обработка данных: {stats["elapsed_seconds"]:.3f} с'))
@@ -144,21 +183,30 @@ def run_pipeline(args, destination, started):
         json.dumps(stats, ensure_ascii=False, allow_nan=False, indent=2) + "\n", encoding="utf-8"
     )
     (destination / "report.html").write_text(
-        make_report(results, screened, scenarios, alerts, forecast, stats, settings), encoding="utf-8"
+        make_report(results, screened, scenarios, forecast, stats, settings), encoding="utf-8"
     )
     return ingestion
 
 
+def execute_run(args, *, run_id=None):
+    started = datetime.now(ZoneInfo("Europe/Moscow"))
+    destination = args.out / (run_id or f"{started:%Y%m%d-%H%M%S}-{uuid4().hex[:8]}")
+    args.out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".opex-", dir=args.out) as temporary:
+        staging = Path(temporary)
+        summary = run_pipeline(args, staging, started)
+        staging.rename(destination)
+    return destination, summary
+
+
 def main(argv=None):
     args = arguments(argv)
-    started = datetime.now(ZoneInfo("Europe/Moscow"))
-    destination = args.out / f"{started:%Y%m%d-%H%M%S}-{uuid4().hex[:8]}"
+    if args.command == "serve":
+        from .web import serve
+
+        return serve(args)
     try:
-        args.out.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".opex-", dir=args.out) as temporary:
-            staging = Path(temporary)
-            summary = run_pipeline(args, staging, started)
-            staging.rename(destination)
+        destination, summary = execute_run(args)
     except (OSError, ValueError, yaml.YAMLError) as error:
         print(f"Ошибка запуска: {error}", file=sys.stderr)
         return 2

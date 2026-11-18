@@ -48,6 +48,8 @@ moex;DEMO01;RUB;2024-10-25;28.85;synthetic:opex-demo/DEMO01;2025-01-10
 moex;DEMO01;RUB;2024-11-25;29.18;synthetic:opex-demo/DEMO01;2025-01-10
 moex;DEMO01;RUB;2024-12-25;29.51;synthetic:opex-demo/DEMO01;2025-01-10
 moex;DEMO01;RUB;2025-01-25;29.84;synthetic:opex-demo/DEMO01;2025-01-10
+moex;DEMO01;RUB;2025-02-25;30.17;synthetic:opex-demo/DEMO01;2025-04-10
+moex;DEMO01;RUB;2025-03-25;30.5;synthetic:opex-demo/DEMO01;2025-04-10
 yahoo;DEMO02;USD;2021-01-25;16.0;synthetic:opex-demo/DEMO02;2025-01-10
 yahoo;DEMO02;USD;2021-02-25;16.33;synthetic:opex-demo/DEMO02;2025-01-10
 yahoo;DEMO02;USD;2021-03-25;16.66;synthetic:opex-demo/DEMO02;2025-01-10

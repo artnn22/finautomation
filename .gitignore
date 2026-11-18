@@ -1,8 +1,11 @@
 docs/personal/*
+/docs/Демонстрация.md
+/docs/ТЗ ОПЕКС обновленное.txt
 ../.DS_Store
 docs/.DS_Store
 .DS_Store
 node_modules
 __pycache__/
 .venv/
+.venv-tools/
 runs/
